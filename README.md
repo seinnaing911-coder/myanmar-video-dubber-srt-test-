@@ -3,7 +3,8 @@
 Streamlit app: one video upload, timestamped speech recognition, Burmese translation and TTS, producing a clean dubbed MP4 with the original audio removed.
 
 ## Included
-- One MP4 / MOV / MKV / WEBM upload.
+- One MP4 / MOV / MKV / WEBM upload, with an optional SRT/TXT subtitle upload.
+- When an SRT is provided, its cue text is used directly for TTS with no transcription or translation; each cue's start/end time is preserved.
 - Optional Gemini API key password field next to the video uploader; Gemini is used only for natural Burmese translation, while speech recognition, TTS, and video rendering continue to use their existing providers. A key entered there is used for the current session and takes priority over the saved app secret.
 - Groq Whisper transcription with local faster-whisper fallback.
 - OpenRouter translation with free MyMemory fallback.
@@ -13,6 +14,7 @@ Streamlit app: one video upload, timestamped speech recognition, Burmese transla
 - Final dubbed video preview plus MP4 and MP3 exports; no source preview, blur, or burned subtitles.
 - Speech segments are timestamped and aligned to their corresponding video windows.
 - Generated Burmese speech remains at natural speed; matching video windows are sped up or slowed down to follow each voice segment.
+- SRT cue windows are cut from the source video one line at a time; gaps keep the original video with silent audio, while each cue window is retimed to its generated voice duration.
 - Long Burmese speech uses chained tempo fitting so words are not cut off when a segment is shorter than the translated narration.
 - Burmese-script validation blocks output when translation fails, instead of reading the original-language text with a Myanmar voice.
 - Free translation sends adjacent narration lines as context-aware chunks so names, events, and story continuity are preserved better than isolated line translation.
@@ -45,7 +47,8 @@ The app uses Groq Whisper when `GROQ_API_KEY` is configured, otherwise it uses l
 Free mode has no AI API bill, but the first local Whisper run downloads a model and CPU processing is slower. Public free translation endpoints can also rate-limit heavy use. For the fastest mode, configure `GROQ_API_KEY` and optionally `OPENROUTER_API_KEY`.
 
 ## Notes
-- The uploaded video must contain an audio track with speech for transcription.
+- Without an SRT, the uploaded video must contain an audio track with speech for transcription. With an SRT, the source video may be silent because the SRT text drives the audio.
+- SRT files should use `HH:MM:SS,mmm --> HH:MM:SS,mmm` (or dot milliseconds) cue timing. Overlapping cues are rejected so each line has one unambiguous video window.
 - Speech recognition timestamps may not be perfect. Very long Burmese lines can be shortened by fitting them into the available slot.
 - Streamlit Cloud CPU, memory, execution time, network access and provider quotas can limit large-video processing.
 - For Streamlit Cloud, keep videos below 200 MB and 15 minutes. If processing stops, reboot the app from Manage app and retry with a shorter video or a smaller Whisper model such as `tiny`.

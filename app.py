@@ -9,6 +9,7 @@ import edge_tts
 APP_TITLE = "🎬 Myanmar Free Video Dubber"
 MAX_MB = 200
 MAX_DURATION_SECONDS = 15 * 60
+MAX_SRT_MB = 5
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
 GEMINI_MODEL = "gemini-3.8-flash"
 OPENROUTER_MODEL = "openrouter/free"
@@ -365,6 +366,58 @@ def stamp(seconds):
     return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
 
 
+def parse_srt(raw_bytes, video_duration):
+    """Read SRT cue text and preserve each cue's exact start/end timeline."""
+    try:
+        raw = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raw = raw_bytes.decode("utf-8", errors="replace")
+    cues = []
+    timestamp = re.compile(
+        r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
+        r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})"
+    )
+    for block in re.split(r"\n\s*\n", raw.replace("\r\n", "\n").replace("\r", "\n")):
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        timing_index = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing_index is None:
+            continue
+        match = timestamp.search(lines[timing_index])
+        if not match:
+            raise RuntimeError(f"SRT timeline code မမှန်ပါ: {lines[timing_index]}")
+        values = [int(value) for value in match.groups()]
+        start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / 1000
+        end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / 1000
+        subtitle = " ".join(lines[timing_index + 1:])
+        subtitle = re.sub(r"<[^>]*>", "", subtitle)
+        subtitle = re.sub(r"\{[^}]*\}", "", subtitle)
+        subtitle = re.sub(r"\s+", " ", subtitle).strip()
+        if not subtitle or end <= start:
+            continue
+        if start >= video_duration:
+            continue
+        cues.append({
+            "start": max(0.0, start),
+            "end": min(video_duration, end),
+            "text": subtitle,
+            "burmese": subtitle,
+        })
+
+    cues.sort(key=lambda item: item["start"])
+    clean = []
+    previous_end = 0.0
+    for index, cue in enumerate(cues, 1):
+        if cue["end"] - cue["start"] < 0.05:
+            continue
+        if cue["start"] < previous_end - 0.02:
+            raise RuntimeError(f"SRT အပိုင်း {index} သည် ယခင်အပိုင်းနှင့် ထပ်နေပါသည်။")
+        clean.append(cue)
+        previous_end = cue["end"]
+    if not clean:
+        raise RuntimeError("Video duration အတွင်း အသုံးပြုနိုင်သော SRT စာကြောင်း မတွေ့ပါ။")
+    return clean
+
+
 def write_srt(segments, duration, path):
     blocks = []
     for index, seg in enumerate(segments, 1):
@@ -374,12 +427,12 @@ def write_srt(segments, duration, path):
     path.write_text("\n".join(blocks), encoding="utf-8-sig")
 
 
-def build_voice_track(segments, voice, workdir, duration, progress_callback=None):
+def build_voice_track(segments, voice, workdir, duration, progress_callback=None, require_burmese=True):
     tts_dir = workdir / "tts_segments"
     tts_dir.mkdir(exist_ok=True)
     prepared = []
     for index, seg in enumerate(segments):
-        if not contains_burmese(seg.get("burmese", "")):
+        if require_burmese and not contains_burmese(seg.get("burmese", "")):
             raise RuntimeError(f"အပိုင်း {index + 1} တွင် မြန်မာစာမရှိပါ။ Final video မထုတ်ပါ။")
         out = tts_dir / f"voice_{index:04d}.mp3"
         asyncio.run(tts_save(seg["burmese"], voice, out))
@@ -397,6 +450,7 @@ def build_voice_track(segments, voice, workdir, duration, progress_callback=None
 
 def render_dubbed_video(source, segments, prepared_audio, duration, output_path,
                         export_mode="TikTok 9:16", color_style="Natural", slight_crop=True):
+    """Cut each SRT cue window and retime only that video window to its TTS duration."""
     if not segments or len(segments) != len(prepared_audio):
         raise RuntimeError("Video/audio segment count မကိုက်ညီပါ။")
 
@@ -407,41 +461,48 @@ def render_dubbed_video(source, segments, prepared_audio, duration, output_path,
     video_labels = []
     audio_labels = []
     filters = []
-    segment_count = len(segments)
-    first_start = max(0.0, min(duration, float(segments[0]["start"])))
-    if first_start > 0.05:
-        filters.append(f"[0:v]trim=start=0:end={first_start:.3f},setpts=PTS-STARTPTS[vprefix]")
-        video_labels.append("[vprefix]")
-        filters.append(f"anullsrc=r=24000:cl=mono,atrim=duration={first_start:.3f},asetpts=PTS-STARTPTS[aprefix]")
-        audio_labels.append("[aprefix]")
+    cursor = 0.0
+    clip_index = 0
+
+    def add_gap(gap_start, gap_end):
+        nonlocal clip_index
+        if gap_end - gap_start <= 0.05:
+            return
+        filters.append(
+            f"[0:v]trim=start={gap_start:.3f}:end={gap_end:.3f},"
+            f"setpts=PTS-STARTPTS[v{clip_index}]"
+        )
+        video_labels.append(f"[v{clip_index}]")
+        filters.append(
+            f"anullsrc=r=24000:cl=mono,atrim=duration={gap_end - gap_start:.3f},"
+            f"asetpts=PTS-STARTPTS[a{clip_index}]"
+        )
+        audio_labels.append(f"[a{clip_index}]")
+        clip_index += 1
 
     for index, (seg, prepared) in enumerate(zip(segments, prepared_audio)):
-        source_start = max(0.0, min(duration, float(seg["start"])))
-        if index + 1 < segment_count:
-            source_end = max(source_start + 0.25, min(duration, float(segments[index + 1]["start"])))
-        else:
-            source_end = max(source_start + 0.25, min(duration, float(seg.get("end", source_start + 0.25))))
-        source_span = max(0.25, source_end - source_start)
+        source_start = max(cursor, max(0.0, min(duration, float(seg["start"]))))
+        source_end = max(source_start + 0.05, min(duration, float(seg["end"])))
+        add_gap(cursor, source_start)
+        source_span = source_end - source_start
         voice_duration = max(0.25, float(prepared[2]))
         speed_ratio = voice_duration / source_span
         filters.append(
             f"[0:v]trim=start={source_start:.3f}:end={source_end:.3f},"
-            f"setpts=PTS-STARTPTS,setpts=PTS*{speed_ratio:.6f}[v{index}]"
+            f"setpts=PTS-STARTPTS,setpts=PTS*{speed_ratio:.6f}[v{clip_index}]"
         )
-        video_labels.append(f"[v{index}]")
+        video_labels.append(f"[v{clip_index}]")
         audio_input_index = index + 1
         filters.append(
-            f"[{audio_input_index}:a]aresample=24000,asetpts=PTS-STARTPTS[a{index}]"
+            f"[{audio_input_index}:a]aresample=24000,asetpts=PTS-STARTPTS[a{clip_index}]"
         )
-        audio_labels.append(f"[a{index}]")
+        audio_labels.append(f"[a{clip_index}]")
+        clip_index += 1
+        cursor = source_end
 
-    last_end = max(0.0, min(duration, float(segments[-1].get("end", segments[-1]["start"]))))
-    if duration - last_end > 0.05:
-        filters.append(f"[0:v]trim=start={last_end:.3f}:end={duration:.3f},setpts=PTS-STARTPTS[vtail]")
-        video_labels.append("[vtail]")
-        tail_duration = duration - last_end
-        filters.append(f"anullsrc=r=24000:cl=mono,atrim=duration={tail_duration:.3f},asetpts=PTS-STARTPTS[atail]")
-        audio_labels.append("[atail]")
+    add_gap(cursor, duration)
+    if not video_labels or not audio_labels:
+        raise RuntimeError("SRT timeline မှ render လုပ်နိုင်သော video segment မရှိပါ။")
 
     filters.append("".join(video_labels) + f"concat=n={len(video_labels)}:v=1:a=0[vout]")
     filters.append("".join(audio_labels) + f"concat=n={len(audio_labels)}:v=0:a=1,"
@@ -470,8 +531,8 @@ def render_dubbed_video(source, segments, prepared_audio, duration, output_path,
         video_map = "[vfinal]"
     else:
         video_map = "[vout]"
-    args += ["-filter_complex", ";".join(filters)]
-    args += ["-map", video_map, "-map", "[aout]",
+    args += ["-filter_complex", ";".join(filters),
+             "-map", video_map, "-map", "[aout]",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", str(output_path)]
     run_cmd(args, timeout=7200)
@@ -479,8 +540,8 @@ def render_dubbed_video(source, segments, prepared_audio, duration, output_path,
 
 def main():
     st.title(APP_TITLE)
-    st.write("Video တစ်ခုတည်းတင်ပါ။ မူရင်းအသံအားလုံးကို ဖယ်ရှားပြီး မြန်မာအသံနဲ့ အစားထိုးပေးပါမယ်။")
-    st.info("မူရင်းဘာသာစကားအသံကို Final MP4 ထဲ မထည့်ဘဲ မြန်မာအသံတစ်ခုတည်း ထည့်ပေးပါမယ်။ API key မရှိရင် Free mode နဲ့ local processing လုပ်နိုင်ပါတယ်။")
+    st.write("Video တင်ပြီး SRT timeline အတိုင်း စာတစ်ကြောင်းချင်းစီကို အသံထုတ်ကာ video အပိုင်းတွေကို အသံကြာချိန်နဲ့ ကိုက်အောင် အနှေးအမြန်ညှိပေးပါမယ်။")
+    st.info("SRT တင်ထားရင် SRT ထဲကစာကိုသာ တိုက်ရိုက်အသံထုတ်ပါမယ်။ SRT မတင်ရင် မူရင်းအသံကို စာသားဖော်ထုတ်ပြီး ယခင်ဘာသာပြန် flow ကို အသုံးပြုပါမယ်။")
 
     groq_key = secret("GROQ_API_KEY")
     saved_gemini_key = secret("GEMINI_API_KEY")
@@ -496,6 +557,11 @@ def main():
             st.stop()
 
     uploaded = st.file_uploader("Video တင်ပါ (MP4 / MOV / MKV / WEBM)", type=["mp4", "mov", "mkv", "webm"])
+    uploaded_srt = st.file_uploader(
+        "SRT တင်ပါ (Optional — SRT တင်ရင် SRT ထဲကစာကိုသာ အသံထုတ်ပါမယ်)",
+        type=["srt", "txt"],
+        help="SRT timecode တစ်ခုချင်းစီအတိုင်း video ကို ခွဲပြီး စာကြောင်းအသံကြာချိန်နဲ့ ကိုက်အောင် video speed ကို ပြောင်းပါမယ်။",
+    )
     gemini_input_key = st.text_input(
         "Gemini API Key — Translation only (Optional)",
         value="",
@@ -539,15 +605,19 @@ def main():
     if uploaded and uploaded.size > MAX_MB * 1024 * 1024:
         st.error(f"Video သည် {MAX_MB} MB ထက်ကျော်နေပါသည်။")
         st.stop()
+    if uploaded_srt and uploaded_srt.size > MAX_SRT_MB * 1024 * 1024:
+        st.error(f"SRT သည် {MAX_SRT_MB} MB ထက်ကျော်နေပါသည်။")
+        st.stop()
 
     if st.button("🎙️ မြန်မာအသံနဲ့ Dubbing လုပ်မယ်", type="primary", disabled=uploaded is None):
-        if not groq_key:
+        if not groq_key and uploaded_srt is None:
             st.info("GROQ_API_KEY မတွေ့ပါ။ အသံမှ စာသားဖော်ထုတ်ရန် Free local Whisper mode ကို အသုံးပြုနေပါတယ်။ Gemini API key သည် စာသားဖော်ထုတ်ခြင်းမဟုတ်ဘဲ နောက်အဆင့် မြန်မာဘာသာပြန်ခြင်းအတွက်သာ အသုံးပြုပါမယ်။ ပထမဆုံး run မှာ Whisper model download လုပ်ရနိုင်ပါတယ်။")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             work = Path(temp_dir)
             video = work / Path(uploaded.name).name
             video.write_bytes(uploaded.getbuffer())
+            srt_bytes = uploaded_srt.getvalue() if uploaded_srt else None
             original_audio = work / "original_for_transcription.mp3"
             output_mp3 = work / "myanmar_voice.mp3"
             output_mp4 = work / "myanmar_dubbed_video.mp4"
@@ -565,35 +635,42 @@ def main():
                 progress.progress(percent, text=f"{label} ({percent}%)")
 
             try:
-                status.info("မူရင်းအသံကို စာသားဖော်ထုတ်ရန် ယာယီထုတ်ယူနေသည်...")
-                extract_audio(video, original_audio)
-                set_progress(8, "အသံဖိုင် ပြင်ဆင်ပြီးပါပြီ")
-
-                status.info("Groq Whisper သို့မဟုတ် Free local Whisper ဖြင့် မူရင်းစကားပြောသံနှင့် အချိန်မှတ်တမ်း ထုတ်ယူနေသည်...")
-                if groq_key:
-                    try:
-                        segments = groq_transcribe(original_audio, groq_key)
-                    except Exception as groq_error:
-                        status.warning(f"Groq မအောင်မြင်ပါ။ Local Whisper ကို စမ်းသုံးနေသည်။ {str(groq_error)[:180]}")
-                        segments = local_whisper_transcribe(original_audio)
+                if srt_bytes is not None:
+                    status.info("SRT timeline နဲ့ စာသားကို ဖတ်နေသည် — SRT ထဲကစာကိုသာ အသံထုတ်ပါမယ်...")
+                    segments = parse_srt(srt_bytes, duration)
+                    translation_provider = "SRT direct text (no translation)"
+                    set_progress(35, f"SRT အပိုင်း {len(segments)} ခု ဖတ်ပြီးပါပြီ")
                 else:
-                    segments = local_whisper_transcribe(original_audio)
-                if not segments:
-                    raise RuntimeError("မူရင်းစကားပြောသံမှ စာသားမရရှိပါ။ Video ထဲတွင် အသံရှိ/မရှိ စစ်ဆေးပါ။")
-                set_progress(35, f"စကားပြောအပိုင်း {len(segments)} ခု ဖော်ထုတ်ပြီးပါပြီ")
+                    status.info("မူရင်းအသံကို စာသားဖော်ထုတ်ရန် ယာယီထုတ်ယူနေသည်...")
+                    extract_audio(video, original_audio)
+                    set_progress(8, "အသံဖိုင် ပြင်ဆင်ပြီးပါပြီ")
 
-                status.info("စာသားအပိုင်းတိုင်းကို မြန်မာလို ဘာသာပြန်နေသည်...")
-                segments, translation_provider = translate_segments(
-                    segments, gemini_key, openrouter_key, grok_key, mymemory_email,
-                    gemini_model, grok_model,
-                    lambda fraction: set_progress(35 + fraction * 25, "မြန်မာဘာသာပြန်နေသည်"))
-                set_progress(62, f"မြန်မာဘာသာပြန်ပြီးပါပြီ ({translation_provider})")
+                    status.info("Groq Whisper သို့မဟုတ် Free local Whisper ဖြင့် မူရင်းစကားပြောသံနှင့် အချိန်မှတ်တမ်း ထုတ်ယူနေသည်...")
+                    if groq_key:
+                        try:
+                            segments = groq_transcribe(original_audio, groq_key)
+                        except Exception as groq_error:
+                            status.warning(f"Groq မအောင်မြင်ပါ။ Local Whisper ကို စမ်းသုံးနေသည်။ {str(groq_error)[:180]}")
+                            segments = local_whisper_transcribe(original_audio)
+                    else:
+                        segments = local_whisper_transcribe(original_audio)
+                    if not segments:
+                        raise RuntimeError("မူရင်းစကားပြောသံမှ စာသားမရရှိပါ။ Video ထဲတွင် အသံရှိ/မရှိ စစ်ဆေးပါ။")
+                    set_progress(35, f"စကားပြောအပိုင်း {len(segments)} ခု ဖော်ထုတ်ပြီးပါပြီ")
+
+                    status.info("စာသားအပိုင်းတိုင်းကို မြန်မာလို ဘာသာပြန်နေသည်...")
+                    segments, translation_provider = translate_segments(
+                        segments, gemini_key, openrouter_key, grok_key, mymemory_email,
+                        gemini_model, grok_model,
+                        lambda fraction: set_progress(35 + fraction * 25, "မြန်မာဘာသာပြန်နေသည်"))
+                    set_progress(62, f"မြန်မာဘာသာပြန်ပြီးပါပြီ ({translation_provider})")
 
                 voice = "my-MM-NilarNeural" if voice_label.startswith("နီလာ") else "my-MM-ThihaNeural"
-                status.info("မြန်မာအသံ အပိုင်းလိုက် ဖန်တီးပြီး မူရင်းအချိန်နဲ့ ညှိနေသည်...")
+                status.info("SRT timeline အပိုင်းတစ်ခုချင်းစီအတွက် အသံဖန်တီးပြီး video speed နဲ့ ညှိနေသည်...")
                 prepared_audio = build_voice_track(
                     segments, voice, work, duration,
-                    lambda fraction: set_progress(62 + fraction * 20, "မြန်မာအသံ ဖန်တီးနေသည်"))
+                    lambda fraction: set_progress(62 + fraction * 20, "စာကြောင်းအသံ ဖန်တီးနေသည်"),
+                    require_burmese=srt_bytes is None)
                 set_progress(84, "မြန်မာအသံ ပြင်ဆင်ပြီးပါပြီ")
 
                 status.info("မူရင်းအသံ Track ကို ဖယ်ရှားပြီး မြန်မာအသံတစ်ခုတည်း ထည့်နေသည်...")
