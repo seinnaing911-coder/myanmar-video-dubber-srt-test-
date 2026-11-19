@@ -373,21 +373,42 @@ def parse_srt(raw_bytes, video_duration):
     except UnicodeDecodeError:
         raw = raw_bytes.decode("utf-8", errors="replace")
     cues = []
-    timestamp = re.compile(
-        r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
-        r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})"
-    )
+
+    def parse_timestamp(value):
+        value = value.strip().split()[0].replace(",", ".")
+        parts = value.split(":")
+        if len(parts) == 2:
+            minutes, seconds = parts
+            hours = 0
+        elif len(parts) == 3:
+            hours, minutes, seconds = parts
+        else:
+            raise ValueError
+        milliseconds = 0
+        if "." in seconds:
+            seconds, fraction = seconds.split(".", 1)
+            milliseconds = int((fraction + "000")[:3])
+        elif len(parts) == 3 and len(seconds) == 3:
+            # Accept the common shorthand 00:03:200 for 3.200 seconds.
+            milliseconds = int(seconds)
+            seconds = minutes
+            minutes = hours
+            hours = 0
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + milliseconds / 1000
+
     for block in re.split(r"\n\s*\n", raw.replace("\r\n", "\n").replace("\r", "\n")):
         lines = [line.strip() for line in block.split("\n") if line.strip()]
         timing_index = next((i for i, line in enumerate(lines) if "-->" in line), None)
         if timing_index is None:
             continue
-        match = timestamp.search(lines[timing_index])
-        if not match:
+        timing_parts = lines[timing_index].split("-->", 1)
+        if len(timing_parts) != 2:
             raise RuntimeError(f"SRT timeline code မမှန်ပါ: {lines[timing_index]}")
-        values = [int(value) for value in match.groups()]
-        start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / 1000
-        end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / 1000
+        try:
+            start = parse_timestamp(timing_parts[0])
+            end = parse_timestamp(timing_parts[1])
+        except (ValueError, IndexError):
+            raise RuntimeError(f"SRT timeline code မမှန်ပါ: {lines[timing_index]}") from None
         subtitle = " ".join(lines[timing_index + 1:])
         subtitle = re.sub(r"<[^>]*>", "", subtitle)
         subtitle = re.sub(r"\{[^}]*\}", "", subtitle)
